@@ -56,18 +56,46 @@ impl fmt::Display for MachineId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct DeviceId(pub MachineId, pub usize);
+
+impl fmt::Display for DeviceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Device-#{}-Machine-#{}", self.1, self.0 .0)
+    }
+}
+
+#[derive(Debug)]
+struct JoinHolder(Option<thread::JoinHandle<Result<()>>>);
+
+impl Drop for JoinHolder {
+    fn drop(&mut self) {
+        self.0.take().unwrap().join().unwrap().unwrap();
+    }
+}
+#[derive(Debug)]
+pub struct Device {
+    id: DeviceId,
+    addr: Ipv4Addr,
+    mask: u8,
+    ctrl: mpsc::UnboundedSender<IfaceCtrl>,
+    //this is here to hold on to the thread until this Device is droped
+    #[allow(dead_code)]
+    join: JoinHolder,
+}
+
 /// Spawns a thread in a new network namespace and configures a TUN interface that sends and
 /// receives IP packets from the tx/rx channels and runs some UDP/TCP networking code in task.
 #[derive(Debug)]
 pub struct Machine<C, E> {
     id: MachineId,
-    addr: Ipv4Addr,
-    mask: u8,
     ns: Namespace,
-    ctrl: mpsc::UnboundedSender<IfaceCtrl>,
+    device: Device,
     tx: mpsc::UnboundedSender<C>,
     rx: mpsc::UnboundedReceiver<E>,
-    join: Option<thread::JoinHandle<Result<()>>>,
+    //this is here to hold on to the thread until this Machine is droped
+    #[allow(dead_code)]
+    join: JoinHolder,
     buffer: VecDeque<E>,
 }
 
@@ -81,25 +109,39 @@ where
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded();
         let (cmd_tx, cmd_rx) = mpsc::unbounded();
         let (event_tx, event_rx) = mpsc::unbounded();
-        let (ns_tx, ns_rx) = oneshot::channel();
-        let join = machine(id, plug, cmd, ctrl_rx, ns_tx, cmd_rx, event_tx);
-        let ns = ns_rx.await.unwrap();
-        Self {
-            id,
+        let (device_tx, device_rx) = oneshot::channel();
+        let ns = Namespace::unshare().unwrap();
+
+        let device_id = DeviceId(id, 0);
+        let device_join = start_device(device_id, device_tx, ctrl_rx, plug);
+
+        let (machine_tx, machine_rx) = oneshot::channel();
+        let join = machine(id, cmd, machine_tx, cmd_rx, event_tx);
+        device_rx.await.unwrap();
+        machine_rx.await.unwrap();
+
+        log::info!("created machine");
+        let device = Device {
+            id: device_id,
             addr: Ipv4Addr::UNSPECIFIED,
             mask: 32,
-            ns,
+            join: JoinHolder(Some(device_join)),
             ctrl: ctrl_tx,
+        };
+        Self {
+            id,
+            ns,
+            device,
             tx: cmd_tx,
             rx: event_rx,
-            join: Some(join),
+            join: JoinHolder(Some(join)),
             buffer: VecDeque::new(),
         }
     }
 }
 
-impl<C, E> Machine<C, E> {
-    pub fn id(&self) -> MachineId {
+impl Device {
+    pub fn id(&self) -> DeviceId {
         self.id
     }
 
@@ -120,6 +162,39 @@ impl<C, E> Machine<C, E> {
         self.addr = addr;
         self.mask = mask;
     }
+    pub fn up(&self) {
+        self.ctrl.unbounded_send(IfaceCtrl::Up).unwrap();
+    }
+
+    pub fn down(&self) {
+        self.ctrl.unbounded_send(IfaceCtrl::Down).unwrap();
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        log::info!("dropping device");
+        self.ctrl.unbounded_send(IfaceCtrl::Exit).ok();
+        log::info!("dropped device");
+    }
+}
+
+impl<C, E> Machine<C, E> {
+    pub fn id(&self) -> MachineId {
+        self.id
+    }
+
+    pub fn addr(&self) -> Ipv4Addr {
+        self.device.addr()
+    }
+
+    pub fn mask(&self) -> u8 {
+        self.device.mask()
+    }
+
+    pub async fn set_addr(&mut self, addr: Ipv4Addr, mask: u8) {
+        self.device.set_addr(addr, mask).await
+    }
 
     pub fn send(&self, cmd: C) {
         self.tx.unbounded_send(cmd).unwrap();
@@ -136,11 +211,11 @@ impl<C, E> Machine<C, E> {
     }
 
     pub fn up(&self) {
-        self.ctrl.unbounded_send(IfaceCtrl::Up).unwrap();
+        self.device.up()
     }
 
     pub fn down(&self) {
-        self.ctrl.unbounded_send(IfaceCtrl::Down).unwrap();
+        self.device.down()
     }
 
     pub fn namespace(&self) -> Namespace {
@@ -216,13 +291,6 @@ impl<C, E> Machine<C, E> {
     }
 }
 
-impl<C, E> Drop for Machine<C, E> {
-    fn drop(&mut self) {
-        self.ctrl.unbounded_send(IfaceCtrl::Exit).ok();
-        self.join.take().unwrap().join().unwrap().unwrap();
-    }
-}
-
 fn abbrev<T: Display>(t: &T, limit: usize, cut_len: usize) -> String {
     use std::fmt::Write;
     struct S(String, usize);
@@ -251,24 +319,13 @@ fn abbrev<T: Display>(t: &T, limit: usize, cut_len: usize) -> String {
     result
 }
 
-#[allow(clippy::too_many_arguments)]
-fn machine<C, E>(
-    id: MachineId,
-    plug: Plug,
-    mut bin: Command,
+fn start_device(
+    id: DeviceId,
+    continue_tx: oneshot::Sender<()>,
     mut ctrl: mpsc::UnboundedReceiver<IfaceCtrl>,
-    ns_tx: oneshot::Sender<Namespace>,
-    mut cmd: mpsc::UnboundedReceiver<C>,
-    event: mpsc::UnboundedSender<E>,
-) -> thread::JoinHandle<Result<()>>
-where
-    C: Display + Send + 'static,
-    E: FromStr + Display + Send + 'static,
-    E::Err: std::fmt::Debug + Display + Send + Sync,
-{
+    plug: Plug,
+) -> thread::JoinHandle<Result<()>> {
     thread::spawn(move || {
-        let ns = Namespace::unshare()?;
-
         let res = async_global_executor::block_on(async move {
             let iface = iface::Iface::new()?;
             let iface = async_io::Async::new(iface)?;
@@ -339,6 +396,38 @@ where
             .fuse();
             futures::pin_mut!(writer_task);
 
+            // unblock here so that possible exec error has a chance to get out
+            let _ = continue_tx.send(());
+
+            log::info!("started {id}'s device event loop");
+            futures::select! {
+                res = ctrl_task => res?,
+                res = reader_task => res?,
+                res = writer_task => res?,
+            };
+
+            Ok(())
+        });
+        log::info!("{}'s device event loop yielded with {:?}", id, res);
+        res
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn machine<C, E>(
+    id: MachineId,
+    mut bin: Command,
+    machine_tx: oneshot::Sender<()>,
+    mut cmd: mpsc::UnboundedReceiver<C>,
+    event: mpsc::UnboundedSender<E>,
+) -> thread::JoinHandle<Result<()>>
+where
+    C: Display + Send + 'static,
+    E: FromStr + Display + Send + 'static,
+    E::Err: std::fmt::Debug + Display + Send + Sync,
+{
+    thread::spawn(move || {
+        let res = async_global_executor::block_on(async move {
             bin.stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -398,12 +487,10 @@ where
             futures::pin_mut!(stderr_task);
 
             // unblock here so that possible exec error has a chance to get out
-            let _ = ns_tx.send(ns);
+            let _ = machine_tx.send(());
 
             futures::select! {
-                res = ctrl_task => res?,
-                res = reader_task => res?,
-                res = writer_task => res?,
+                //res = device_task => res?,
                 res = command_task => res?,
                 res = event_task => res?,
                 res = stderr_task => res?,
