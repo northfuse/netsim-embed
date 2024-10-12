@@ -1,0 +1,7 @@
+error: custom attribute panicked
+ --> tests/macros/failures/invalid_return.rs:1:1
+  |
+1 | #[netsim_embed_macros::machine]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = help: message: netsim_embed::machine must not declare a return type

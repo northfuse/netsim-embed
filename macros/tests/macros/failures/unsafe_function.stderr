@@ -1,0 +1,7 @@
+error: custom attribute panicked
+ --> tests/macros/failures/unsafe_function.rs:1:1
+  |
+1 | #[netsim_embed_macros::machine]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = help: message: netsim_embed::machine cannot be unsafe
