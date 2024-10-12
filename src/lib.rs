@@ -139,17 +139,38 @@ where
             let addr = addr.unwrap_or_else(|| net.unique_addr());
             let mask = net.range.netmask_prefix_length();
             net.router
-                .add_connection(machine.0, plug, vec![addr.into()]);
+                .add_connection(ConnectionId::Machine(machine.0), plug, vec![addr.into()]);
             log::debug!("Setting {}'s address to {}/{}", machine, addr, mask);
             self.machines[machine.0].set_addr(addr, mask).await;
         }
+    }
+
+    pub async fn plug_additional(
+        &mut self,
+        machine_id: MachineId,
+        net: NetworkId,
+        addr: Option<Ipv4Addr>,
+    ) {
+        let machine = self.machine(machine_id);
+        let (plug_a, plug_b) = wire();
+        let device = machine.add_device(plug_b).await;
+
+        let net = &mut self.networks[net.0];
+        let addr = addr.unwrap_or_else(|| net.unique_addr());
+        let mask = net.range.netmask_prefix_length();
+        net.router
+            .add_connection(ConnectionId::Device(5), plug_a, vec![addr.into()]);
+        log::debug!("Setting {}'s address to {}/{}", device, addr, mask);
+        self.machines[machine_id.0]
+            .set_device_addr(device, addr, mask)
+            .await;
     }
 
     pub async fn unplug(&mut self, machine: MachineId) {
         if let Connector::Plugged(net) = self.plugs[machine.0] {
             self.plugs[machine.0] = if let Some(plug) = self.networks[net.0]
                 .router
-                .remove_connection(machine.0)
+                .remove_connection(ConnectionId::Machine(machine.0))
                 .await
             {
                 Connector::Unplugged(plug)
@@ -163,22 +184,34 @@ where
         let (plug_a, plug_b) = wire();
         let range_a = self.networks[net_a.0].range;
         let range_b = self.networks[net_b.0].range;
-        self.networks[net_a.0]
-            .router
-            .add_connection(net_b.id(), plug_b, vec![range_b.into()]);
-        self.networks[net_b.0]
-            .router
-            .add_connection(net_a.id(), plug_a, vec![range_a.into()]);
+        self.networks[net_a.0].router.add_connection(
+            ConnectionId::Net(net_b.id()),
+            plug_b,
+            vec![range_b.into()],
+        );
+        self.networks[net_b.0].router.add_connection(
+            ConnectionId::Net(net_a.id()),
+            plug_a,
+            vec![range_a.into()],
+        );
     }
 
     pub fn enable_route(&mut self, net_a: NetworkId, net_b: NetworkId) {
-        self.networks[net_a.0].router.enable_route(net_b.id());
-        self.networks[net_b.0].router.enable_route(net_a.id());
+        self.networks[net_a.0]
+            .router
+            .enable_route(ConnectionId::Net(net_b.id()));
+        self.networks[net_b.0]
+            .router
+            .enable_route(ConnectionId::Net(net_a.id()));
     }
 
     pub fn disable_route(&mut self, net_a: NetworkId, net_b: NetworkId) {
-        self.networks[net_a.0].router.disable_route(net_b.id());
-        self.networks[net_b.0].router.disable_route(net_a.id());
+        self.networks[net_a.0]
+            .router
+            .disable_route(ConnectionId::Net(net_b.id()));
+        self.networks[net_b.0]
+            .router
+            .disable_route(ConnectionId::Net(net_a.id()));
     }
 
     pub fn add_nat_route(
@@ -201,12 +234,12 @@ where
         }
         async_global_executor::spawn(nat).detach();
         self.networks[public_net.0].router.add_connection(
-            private_net.id(),
+            ConnectionId::Net(private_net.id()),
             public,
             vec![Ipv4Range::new(nat_addr, 32).into()],
         );
         self.networks[private_net.0].router.add_connection(
-            public_net.id(),
+            ConnectionId::Net(public_net.id()),
             private,
             vec![Ipv4Range::global().into()],
         );

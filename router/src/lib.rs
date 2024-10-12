@@ -14,13 +14,20 @@ use std::{
     task::Poll,
 };
 
+#[derive(Debug, PartialEq)]
+pub enum ConnectionId {
+    Device(usize),
+    Machine(usize),
+    Net(usize),
+}
+
 #[derive(Debug)]
 #[allow(clippy::enum_variant_names)]
 enum RouterCtrl {
-    AddRoute(usize, Plug, Vec<Ipv4Route>),
-    RemoveRoute(usize, oneshot::Sender<Option<Plug>>),
-    EnableRoute(usize),
-    DisableRoute(usize),
+    AddRoute(ConnectionId, Plug, Vec<Ipv4Route>),
+    RemoveRoute(ConnectionId, oneshot::Sender<Option<Plug>>),
+    EnableRoute(ConnectionId),
+    DisableRoute(ConnectionId),
 }
 
 #[derive(Debug)]
@@ -85,13 +92,13 @@ impl Ipv4Router {
         *self.counters.filter.lock().unwrap() = filter;
     }
 
-    pub fn add_connection(&self, id: usize, plug: Plug, routes: Vec<Ipv4Route>) {
+    pub fn add_connection(&self, id: ConnectionId, plug: Plug, routes: Vec<Ipv4Route>) {
         self.ctrl
             .unbounded_send(RouterCtrl::AddRoute(id, plug, routes))
             .ok();
     }
 
-    pub async fn remove_connection(&self, id: usize) -> Option<Plug> {
+    pub async fn remove_connection(&self, id: ConnectionId) -> Option<Plug> {
         let (tx, rx) = oneshot::channel();
         self.ctrl
             .unbounded_send(RouterCtrl::RemoveRoute(id, tx))
@@ -99,13 +106,13 @@ impl Ipv4Router {
         rx.await.unwrap()
     }
 
-    pub fn enable_route(&self, id: usize) {
+    pub fn enable_route(&self, id: ConnectionId) {
         self.ctrl
             .unbounded_send(RouterCtrl::EnableRoute(id))
             .unwrap();
     }
 
-    pub fn disable_route(&self, id: usize) {
+    pub fn disable_route(&self, id: ConnectionId) {
         self.ctrl
             .unbounded_send(RouterCtrl::DisableRoute(id))
             .unwrap();
@@ -151,7 +158,9 @@ fn router(addr: Ipv4Addr, counters: Arc<Counters>, mut ctrl: mpsc::UnboundedRece
     }).detach()
 }
 
-async fn incoming(conns: &mut [(usize, Plug, Vec<Ipv4Route>, bool)]) -> (usize, Option<Vec<u8>>) {
+async fn incoming(
+    conns: &mut [(ConnectionId, Plug, Vec<Ipv4Route>, bool)],
+) -> (usize, Option<Vec<u8>>) {
     let mut futures = conns
         .iter_mut()
         .enumerate()
@@ -168,7 +177,7 @@ async fn incoming(conns: &mut [(usize, Plug, Vec<Ipv4Route>, bool)]) -> (usize, 
 fn forward_packet(
     addr: Ipv4Addr,
     counters: &Counters,
-    conns: &mut [(usize, Plug, Vec<Ipv4Route>, bool)],
+    conns: &mut [(ConnectionId, Plug, Vec<Ipv4Route>, bool)],
     bytes: Vec<u8>,
 ) {
     let count = counters.filter.lock().unwrap().iter().all(|f| f(&bytes));

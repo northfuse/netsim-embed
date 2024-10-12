@@ -91,6 +91,8 @@ pub struct Machine<C, E> {
     id: MachineId,
     ns: Namespace,
     device: Device,
+    device_count: usize,
+    additional_devices: Vec<Device>,
     tx: mpsc::UnboundedSender<C>,
     rx: mpsc::UnboundedReceiver<E>,
     //this is here to hold on to the thread until this Machine is droped
@@ -132,6 +134,8 @@ where
             id,
             ns,
             device,
+            device_count: 1,
+            additional_devices: vec![],
             tx: cmd_tx,
             rx: event_rx,
             join: JoinHolder(Some(join)),
@@ -184,6 +188,30 @@ impl<C, E> Machine<C, E> {
         self.id
     }
 
+    pub async fn add_device(&mut self, plug: Plug) -> DeviceId {
+        let device_id = DeviceId(self.id, self.device_count);
+        self.device_count = self.device_count + 1;
+
+        let (ctrl_tx, ctrl_rx) = mpsc::unbounded();
+        let (device_tx, device_rx) = oneshot::channel();
+
+        let device_join = start_device(device_id, device_tx, ctrl_rx, plug);
+
+        device_rx.await.unwrap();
+
+        log::info!("created machine");
+        let device = Device {
+            id: device_id,
+            addr: Ipv4Addr::UNSPECIFIED,
+            mask: 32,
+            join: JoinHolder(Some(device_join)),
+            ctrl: ctrl_tx,
+        };
+        self.additional_devices.push(device);
+
+        device_id
+    }
+
     pub fn addr(&self) -> Ipv4Addr {
         self.device.addr()
     }
@@ -194,6 +222,14 @@ impl<C, E> Machine<C, E> {
 
     pub async fn set_addr(&mut self, addr: Ipv4Addr, mask: u8) {
         self.device.set_addr(addr, mask).await
+    }
+
+    pub async fn set_device_addr(&mut self, device_id: DeviceId, addr: Ipv4Addr, mask: u8) {
+        for device in self.additional_devices.iter_mut() {
+            if device.id == device_id {
+                device.set_addr(addr, mask).await
+            }
+        }
     }
 
     pub fn send(&self, cmd: C) {
